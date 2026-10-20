@@ -10,6 +10,14 @@
 // Esto desplazó "Margen" (idx 9) y "Ganancia Potencial" (idx 10)
 // una posición hacia la derecha respecto a la versión anterior.
 //
+// CORRECCIÓN: al eliminar/restar un ítem de una comanda que es una
+// PRESENTACIÓN (six-pack, caja, etc.), ahora se devuelve al inventario
+// la cantidad correcta de unidades base (paquetes × unidades por paquete).
+// Antes no se devolvía nada porque el nombre de la presentación no existe
+// como producto en Inventario. Ver resolverItemInventario().
+// También se corrigió cerrarMesa(): los movimientos de presentaciones
+// ahora se registran contra el producto base con su costo real.
+//
 // Layout de la hoja Inventario (0-indexado):
 // 0 ID | 1 Producto | 2 Categoría | 3 Unidad | 4 Stock Actual
 // 5 Stock Mínimo | 6 Precio Compra | 7 Precio Local
@@ -44,8 +52,8 @@ const TIPOS_ENTREGA = {
 // CONFIGURACIÓN GLOBAL
 // ─────────────────────────────────────────
 const CONFIG = {
-  CORREOS_ADMIN:        ["zona97k@gmail.com", "ivancastrouju20@gmail.com"],
-  CORREOS_OPERARIO:     ["zona96kventas@gmail.com"],
+  CORREOS_ADMIN:        ["ivancastrouju20@gmail.com"],
+  CORREOS_OPERARIO:     ["ivancastrouju20@gmail.com"],
   STOCK_MINIMO_DEFAULT: 10,
   CORREO_ALERTAS:       ["zona97k@gmail.com"],
   NOMBRE_NEGOCIO:       "Zona 96 K",
@@ -320,6 +328,38 @@ function precioSegunEntrega(precioLocal, precioDomicilio, tipoEntrega) {
   return tipoEntrega === TIPOS_ENTREGA.DOMICILIO ? precioDomicilio : precioLocal;
 }
 
+// Dado el nombre guardado en Comandas, devuelve la fila (0-indexada dentro de
+// datosInv) del producto base en Inventario y cuántas unidades base consume
+// cada unidad del ítem (1 para un producto suelto, N para una presentación x N).
+//
+// Los nombres de presentación se guardan en Comandas con el formato:
+//   "<Producto base> - <Nombre presentación> (x<unidades>)"
+// y ese nombre NO existe como producto en Inventario, por eso antes no se
+// encontraba al eliminar/restar y el stock nunca se devolvía.
+//
+// Incluye presentaciones desactivadas a propósito: una mesa abierta todavía
+// puede tener una presentación que luego se desactivó.
+function resolverItemInventario(nombreItem, datosInv, datosPres) {
+  // 1) Producto suelto
+  for (let j = 1; j < datosInv.length; j++) {
+    if (datosInv[j][1] === nombreItem) {
+      return { filaInv: j, nombreBase: datosInv[j][1], unidadesPorItem: 1 };
+    }
+  }
+  // 2) Presentación
+  for (let p = 1; p < (datosPres || []).length; p++) {
+    if (!datosPres[p][0]) continue;
+    for (let j = 1; j < datosInv.length; j++) {
+      if (datosInv[j][0] != datosPres[p][1]) continue;
+      const esperado = `${datosInv[j][1]} - ${datosPres[p][2]} (x${datosPres[p][3]})`;
+      if (esperado === nombreItem) {
+        return { filaInv: j, nombreBase: datosInv[j][1], unidadesPorItem: Number(datosPres[p][3]) || 1 };
+      }
+    }
+  }
+  return null;
+}
+
 // Un número solo es "válido" para operar si es un number real y finito
 // (descarta NaN, undefined, Infinity). Usado para blindar las celdas combinadas
 // de Comandas contra líneas dañadas que de otro modo contaminarían las sumas.
@@ -393,9 +433,6 @@ function abrirMesa(nombreMesa) {
   return { exito: false, mensaje: "Mesa no encontrada." };
 }
 
-// Agrega un ítem a la fila ABIERTA de Comandas de una mesa, combinando
-// Producto/Cantidad/Precio Unitario/Subtotal en la misma celda (separados por ", ").
-// Si aún no existe una fila abierta para esa mesa, la crea con el primer ítem.
 // Agrega un ítem a la comanda ABIERTA de una mesa. Cada producto vive en SU
 // PROPIA fila (nunca se combinan varios productos en una misma celda — ese
 // diseño causaba "NaN" y mezclas entre productos distintos). Si el mismo
@@ -538,9 +575,11 @@ function cerrarMesa(nombreMesa, pagos) {
   const hojaComandas    = ss.getSheetByName(HOJAS.COMANDAS);
   const hojaMesas       = ss.getSheetByName(HOJAS.MESAS);
   const hojaInv         = ss.getSheetByName(HOJAS.INVENTARIO);
+  const hojaPres        = ss.getSheetByName(HOJAS.PRESENTACIONES);
 
-  const datos    = hojaComandas.getDataRange().getValues();
-  const datosInv = hojaInv.getDataRange().getValues();
+  const datos     = hojaComandas.getDataRange().getValues();
+  const datosInv  = hojaInv.getDataRange().getValues();
+  const datosPres = hojaPres ? hojaPres.getDataRange().getValues() : [];
 
   const itemsCerrar = [];
   let total = 0;
@@ -569,19 +608,28 @@ function cerrarMesa(nombreMesa, pagos) {
     hojaComandas.getRange(item.fila, 11).setValue(total);
   });
 
+  // Los movimientos se registran SIEMPRE contra el producto base y en unidades
+  // base. Para una presentación (six-pack, etc.) se convierte: paquetes ×
+  // unidades por paquete, y el precio de venta se expresa por unidad base, así
+  // Dashboard y Reportes calculan ingresos/ganancia reales.
   itemsCerrar.forEach(item => {
-    let precioCompra = 0, stockActual = 0;
-    for (let j = 1; j < datosInv.length; j++) {
-      if (datosInv[j][1] === item.nombreProducto) {
-        precioCompra = datosInv[j][6];
-        stockActual  = datosInv[j][4];
-        break;
-      }
+    const res = resolverItemInventario(item.nombreProducto, datosInv, datosPres);
+    let nombreMov = item.nombreProducto, precioCompra = 0, stockActual = 0;
+    let unidades = item.cantidad, precioUnitarioMov = item.precioVenta, extra = "";
+
+    if (res) {
+      nombreMov         = res.nombreBase;
+      precioCompra      = datosInv[res.filaInv][6];
+      stockActual       = datosInv[res.filaInv][4];
+      unidades          = item.cantidad * res.unidadesPorItem;
+      precioUnitarioMov = item.precioVenta / res.unidadesPorItem;
+      if (res.unidadesPorItem > 1) extra = ` | Presentación: ${item.nombreProducto} (${item.cantidad} paq.)`;
     }
+
     registrarMovimiento(
-      TIPOS_MOVIMIENTO.SALIDA, item.nombreProducto, item.cantidad,
-      stockActual + item.cantidad, stockActual, precioCompra, item.precioVenta,
-      `Mesa: ${nombreMesa} | Pago: ${norm.texto}`
+      TIPOS_MOVIMIENTO.SALIDA, nombreMov, unidades,
+      stockActual + unidades, stockActual, precioCompra, precioUnitarioMov,
+      `Mesa: ${nombreMesa} | Pago: ${norm.texto}${extra}`
     );
   });
 
@@ -606,9 +654,11 @@ function eliminarItemComanda(nombreMesa, nombreProducto, cantidad, subtotal) {
   const hojaComandas = ss.getSheetByName(HOJAS.COMANDAS);
   const hojaInv      = ss.getSheetByName(HOJAS.INVENTARIO);
   const hojaMesas    = ss.getSheetByName(HOJAS.MESAS);
+  const hojaPres     = ss.getSheetByName(HOJAS.PRESENTACIONES);
 
-  const datos    = hojaComandas.getDataRange().getValues();
-  const datosInv = hojaInv.getDataRange().getValues();
+  const datos     = hojaComandas.getDataRange().getValues();
+  const datosInv  = hojaInv.getDataRange().getValues();
+  const datosPres = hojaPres ? hojaPres.getDataRange().getValues() : [];
 
   for (let i = 1; i < datos.length; i++) {
     if (
@@ -616,16 +666,15 @@ function eliminarItemComanda(nombreMesa, nombreProducto, cantidad, subtotal) {
       datos[i][4] === nombreProducto    &&
       datos[i][8] === ESTADOS_COMANDA.ABIERTA
     ) {
-      let filaInv = -1;
-      for (let j = 1; j < datosInv.length; j++) {
-        if (datosInv[j][1] === nombreProducto) { filaInv = j; break; }
-      }
+      // Resuelve tanto productos sueltos como presentaciones (six-pack, etc.)
+      const res = resolverItemInventario(nombreProducto, datosInv, datosPres);
 
       const cantidadFila = Number(datos[i][5]) || 0;
       hojaComandas.deleteRow(i + 1);
 
-      if (filaInv >= 0) {
-        const stockRestaurado = datosInv[filaInv][4] + cantidadFila;
+      if (res) {
+        const filaInv         = res.filaInv;
+        const stockRestaurado = datosInv[filaInv][4] + cantidadFila * res.unidadesPorItem;
         const gananciaNueva   = (datosInv[filaInv][7] - datosInv[filaInv][6]) * stockRestaurado;
         hojaInv.getRange(filaInv + 1, 5).setValue(stockRestaurado);
         hojaInv.getRange(filaInv + 1, 11).setValue(gananciaNueva);
@@ -649,7 +698,7 @@ function eliminarItemComanda(nombreMesa, nombreProducto, cantidad, subtotal) {
 // Resta una cantidad PARCIAL de un producto ya agregado a la comanda ABIERTA de una
 // mesa (ej. el cliente pidió 7 Poker pero solo quiere pagar/consumir 3). Si la
 // cantidad a restar iguala o supera lo que hay, el ítem se elimina por completo,
-// igual que eliminarItemComanda.
+// igual que eliminarItemComanda. Soporta presentaciones (six-pack, etc.).
 function restarCantidadComanda(nombreMesa, nombreProducto, cantidadARestar) {
   verificarAcceso();
   cantidadARestar = parseInt(cantidadARestar);
@@ -659,8 +708,10 @@ function restarCantidadComanda(nombreMesa, nombreProducto, cantidadARestar) {
   const hojaComandas = ss.getSheetByName(HOJAS.COMANDAS);
   const hojaInv      = ss.getSheetByName(HOJAS.INVENTARIO);
   const hojaMesas    = ss.getSheetByName(HOJAS.MESAS);
+  const hojaPres     = ss.getSheetByName(HOJAS.PRESENTACIONES);
 
-  const datos = hojaComandas.getDataRange().getValues();
+  const datos     = hojaComandas.getDataRange().getValues();
+  const datosPres = hojaPres ? hojaPres.getDataRange().getValues() : [];
 
   for (let i = 1; i < datos.length; i++) {
     if (datos[i][1] !== nombreMesa || datos[i][4] !== nombreProducto || datos[i][8] !== ESTADOS_COMANDA.ABIERTA) continue;
@@ -682,15 +733,12 @@ function restarCantidadComanda(nombreMesa, nombreProducto, cantidadARestar) {
     const eliminadoPorCompleto = cantidadRestante <= 0;
 
     const datosInv = hojaInv.getDataRange().getValues();
-    let filaInv = -1;
-    for (let j = 1; j < datosInv.length; j++) {
-      if (datosInv[j][1] === nombreProducto) { filaInv = j; break; }
-    }
-    if (filaInv >= 0) {
-      const stockRestaurado = datosInv[filaInv][4] + cantidadARestar;
-      const gananciaNueva   = (datosInv[filaInv][7] - datosInv[filaInv][6]) * stockRestaurado;
-      hojaInv.getRange(filaInv + 1, 5).setValue(stockRestaurado);
-      hojaInv.getRange(filaInv + 1, 11).setValue(gananciaNueva);
+    const res = resolverItemInventario(nombreProducto, datosInv, datosPres);
+    if (res) {
+      const stockRestaurado = datosInv[res.filaInv][4] + cantidadARestar * res.unidadesPorItem;
+      const gananciaNueva   = (datosInv[res.filaInv][7] - datosInv[res.filaInv][6]) * stockRestaurado;
+      hojaInv.getRange(res.filaInv + 1, 5).setValue(stockRestaurado);
+      hojaInv.getRange(res.filaInv + 1, 11).setValue(gananciaNueva);
     }
 
     if (eliminadoPorCompleto) {
@@ -923,7 +971,14 @@ function agregarProducto(datos) {
     }
   }
 
-  const nuevoId = hoja.getLastRow();
+  // ID = máximo existente + 1. No se usa getLastRow() porque ahora se pueden
+  // eliminar productos y eso repetiría IDs ya usados.
+  let maxId = 0;
+  for (let i = 1; i < filas.length; i++) {
+    const idN = Number(filas[i][0]);
+    if (idN > maxId) maxId = idN;
+  }
+  const nuevoId = maxId + 1;
   const margen  = precioLocal - precioCompra;
 
   hoja.appendRow([
@@ -939,6 +994,66 @@ function agregarProducto(datos) {
     "Stock inicial al crear producto"
   );
   return { exito: true, mensaje: `Producto "${nombreProducto}" agregado correctamente.` };
+}
+
+// Elimina un producto del Inventario (solo ADMIN).
+// - Bloquea si el producto (o alguna de sus presentaciones) está en una comanda
+//   ABIERTA de alguna mesa, para no dejar cuentas con ítems huérfanos.
+// - Desactiva las presentaciones (six-pack, etc.) que dependían de ese producto.
+// - El historial (Movimientos, Comandas cerradas, Reportes) se conserva: ahí el
+//   producto queda guardado por nombre.
+function eliminarProducto(idProducto) {
+  verificarRolAdmin();
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaInv  = ss.getSheetByName(HOJAS.INVENTARIO);
+  const datosInv = hojaInv.getDataRange().getValues();
+
+  let fila = -1, nombre = "", stock = 0;
+  for (let i = 1; i < datosInv.length; i++) {
+    if (datosInv[i][0] == idProducto) {
+      fila   = i + 1;
+      nombre = datosInv[i][1];
+      stock  = datosInv[i][4];
+      break;
+    }
+  }
+  if (fila === -1) return { exito: false, mensaje: "Producto no encontrado." };
+
+  // Nombres con los que este producto puede aparecer en una comanda
+  const nombresEnComanda = {};
+  nombresEnComanda[nombre] = true;
+
+  const hojaPres  = ss.getSheetByName(HOJAS.PRESENTACIONES);
+  const datosPres = hojaPres ? hojaPres.getDataRange().getValues() : [];
+  const filasPres = [];
+  for (let p = 1; p < datosPres.length; p++) {
+    if (!datosPres[p][0] || datosPres[p][1] != idProducto) continue;
+    filasPres.push(p + 1);
+    nombresEnComanda[`${nombre} - ${datosPres[p][2]} (x${datosPres[p][3]})`] = true;
+  }
+
+  const hojaComandas = ss.getSheetByName(HOJAS.COMANDAS);
+  const datosCom     = hojaComandas ? hojaComandas.getDataRange().getValues() : [];
+  for (let i = 1; i < datosCom.length; i++) {
+    if (datosCom[i][8] === ESTADOS_COMANDA.ABIERTA && nombresEnComanda[datosCom[i][4]]) {
+      return {
+        exito: false,
+        mensaje: `No se puede eliminar "${nombre}": está en la cuenta abierta de ${datosCom[i][1]}. Cierra la cuenta o quita el producto primero.`
+      };
+    }
+  }
+
+  // Todo validado: desactivar presentaciones y eliminar la fila del inventario
+  filasPres.forEach(f => hojaPres.getRange(f, 7).setValue(false));
+  hojaInv.deleteRow(fila);
+  actualizarHojaAlertas();
+
+  registrarLog("PRODUCTO ELIMINADO", `${nombre} | ID ${idProducto} | Stock al eliminar: ${stock} | Presentaciones desactivadas: ${filasPres.length}`);
+  return {
+    exito: true,
+    mensaje: `Producto "${nombre}" eliminado.` +
+      (filasPres.length ? ` Se desactivaron ${filasPres.length} presentación(es).` : "")
+  };
 }
 
 function mostrarFormularioPrecios() {
@@ -2178,8 +2293,8 @@ if (typeof module !== "undefined" && module.exports) {
     ESTADOS_MESA, ESTADOS_COMANDA, TIPOS_MOVIMIENTO, TIPOS_ENTREGA, CONFIG, HOJAS,
     crearHojaInventario, crearHojaMovimientos, crearHojaAlertas, crearHojaLogs,
     crearHojaMesas, crearHojaComandas, obtenerHistorialComandas,
-    construirMapaInventario, precioSegunEntrega,
-    agregarProducto, actualizarPrecio,
+    construirMapaInventario, precioSegunEntrega, resolverItemInventario,
+    agregarProducto, actualizarPrecio, eliminarProducto,
     registrarEntrada, registrarSalida, procesarEntrada, procesarSalida,
     registrarMovimiento, actualizarHojaAlertas, obtenerProductosBajoStock,
     obtenerListaProductos, obtenerDatosInterfaz, calcularMetricasDashboard,
