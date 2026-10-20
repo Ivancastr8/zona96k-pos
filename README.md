@@ -28,9 +28,11 @@ El sistema pasó por una revisión estructural importante: el diseño original a
 
 Proyecto funcional en uso por el negocio. Desarrollo y mantenimiento continuo.
 
-<img src="Images/Alertas.jpeg" width="300" alt="Alerta del sistema">
-<img src="Images/Inicio.jpeg" width="300" alt="Inicio del sistema">
 
+<img src="Images/Inicio.jpeg" width="300" alt="Inicio del sistema">
+<img src="Images/Alertas.jpeg" width="300" alt="Alerta del sistema">
+<img src="Images/Inventario.jpeg" width="300" alt="Inventario del sistema">
+<img src="Mesas/Inventario.jpeg" width="300" alt="Inventario del sistema">
 ---
 
 *Desarrollado por [Iván Castro Ujueta](https://github.com/Ivancastr8)*
