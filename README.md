@@ -28,7 +28,7 @@ El sistema pasó por una revisión estructural importante: el diseño original a
 
 Proyecto funcional en uso por el negocio. Desarrollo y mantenimiento continuo.
 
-<img src="images/inicio.jpg" width="300" alt="Inicio Pagina Principal">
+<img src="images/Inicio.jpeg" width="300" alt="Inicio">
 
 ---
 
